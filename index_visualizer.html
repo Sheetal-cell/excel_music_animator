@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Excel → Web Visualizer</title>
+  <style>
+    body { font-family: Arial, sans-serif; display:flex; gap:20px; padding:20px; }
+    #left { width:380px; }
+    canvas { border:1px solid #ddd; background:#111; display:block; }
+    .note { padding:6px; margin:4px 0; border-radius:4px; color:#fff; font-weight:600; }
+    #drop { border:2px dashed #888; padding:20px; text-align:center; color:#bbb; margin-bottom:12px; }
+  </style>
+</head>
+<body>
+  <div id="left">
+    <h3>Drag & drop score.csv</h3>
+    <div id="drop">Drop CSV here (columns: start,duration,note,velocity,color)</div>
+    <input id="fileInput" type="file" accept=".csv" />
+    <div id="notes"></div>
+    <hr />
+    <button id="playBtn">Play (web audio)</button>
+    <button id="stopBtn">Stop</button>
+  </div>
+
+  <div id="right">
+    <canvas id="cv" width="900" height="300"></canvas>
+  </div>
+
+<script>
+/*
+CSV format expected:
+start,duration,note,velocity,color
+0.0,0.5,C4,100,#ff4444
+...
+*/
+let audioCtx = null;
+let scheduled = [];
+let visualNotes = [];
+let isPlaying = false;
+
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const notesDiv = document.getElementById('notes');
+const playBtn = document.getElementById('playBtn');
+const stopBtn = document.getElementById('stopBtn');
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+
+drop.addEventListener('dragover', e=>{ e.preventDefault(); drop.style.borderColor='#66f'; });
+drop.addEventListener('dragleave', e=>{ drop.style.borderColor='#888'; });
+drop.addEventListener('drop', e=>{ e.preventDefault(); drop.style.borderColor='#888'; handleFiles(e.dataTransfer.files); });
+fileInput.addEventListener('change', e=>handleFiles(e.target.files));
+
+function handleFiles(files){
+  if(!files || files.length===0) return;
+  const f = files[0];
+  const reader = new FileReader();
+  reader.onload = ev=>{
+    parseCSV(ev.target.result);
+  };
+  reader.readAsText(f);
+}
+
+function parseCSV(csv){
+  const lines = csv.trim().split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  const header = lines[0].split(',').map(h=>h.trim().toLowerCase());
+  const idx = {};
+  header.forEach((h,i)=>idx[h]=i);
+  visualNotes = lines.slice(1).map(l=>{
+    const cols = l.split(',').map(c=>c.trim());
+    return {
+      start: parseFloat(cols[idx['start']]||0),
+      duration: parseFloat(cols[idx['duration']]||0.5),
+      note: cols[idx['note']]||'A4',
+      velocity: parseInt(cols[idx['velocity']]||100),
+      color: cols[idx['color']]||'#4da6ff'
+    };
+  });
+  renderNoteList();
+  drawTimeline();
+}
+
+function renderNoteList(){
+  notesDiv.innerHTML = '';
+  visualNotes.forEach(n=>{
+    const d = document.createElement('div');
+    d.className='note';
+    d.style.background = n.color;
+    d.textContent = `${n.note} @ ${n.start}s for ${n.duration}s (vel ${n.velocity})`;
+    notesDiv.appendChild(d);
+  });
+}
+
+function drawTimeline(now=0){
+  ctx.clearRect(0,0,cv.width, cv.height);
+  const total = Math.max(1, ...visualNotes.map(n=>n.start + n.duration));
+  const h = cv.height;
+  visualNotes.forEach((n,i)=>{
+    const x = (n.start / total) * (cv.width - 40) + 20;
+    const w = (n.duration / total) * (cv.width - 40);
+    const y = 20 + i*24;
+    ctx.fillStyle = n.color;
+    ctx.globalAlpha = (now >= n.start && now <= n.start + n.duration) ? 1.0 : 0.45;
+    ctx.fillRect(x, y, Math.max(2,w), 18);
+    ctx.globalAlpha = 1.0;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(n.note, x+4, y+13);
+  });
+}
+
+function noteToFreq(note){
+  // parse C#4, Bb3 etc
+  note = note.replace('♯','#').replace('♭','b');
+  const m = note.match(/^([A-Ga-g])([#b]?)(-?\d+)$/);
+  if(!m) return 440;
+  const name = m[1].toUpperCase();
+  const acc = m[2];
+  const oct = parseInt(m[3]);
+  const semis = {'C':0,'D':2,'E':4,'F':5,'G':7,'A':9,'B':11};
+  let base = semis[name];
+  if(acc === '#') base += 1;
+  if(acc === 'b') base -= 1;
+  const midi = 12 + base + (oct * 12);
+  return 440 * Math.pow(2, (midi - 69)/12);
+}
+
+function playWeb(){
+  if(!visualNotes || visualNotes.length===0) return;
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  isPlaying = true;
+  const startAt = audioCtx.currentTime + 0.1;
+  scheduled.forEach(o=>o.source.stop()); scheduled = [];
+  visualNotes.forEach(n=>{
+    const freq = noteToFreq(n.note);
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    // small richness by adding a second oscillator
+    const osc2 = audioCtx.createOscillator();
+    const gain2 = audioCtx.createGain();
+    osc.frequency.value = freq;
+    osc2.frequency.value = freq * 2;
+    gain.gain.value = (n.velocity/127) * 0.25;
+    gain2.gain.value = gain.gain.value * 0.08;
+    osc.connect(gain);
+    osc2.connect(gain2);
+    gain.connect(audioCtx.destination);
+    gain2.connect(audioCtx.destination);
+    const s = startAt + n.start;
+    const e = s + n.duration;
+    gain.gain.setValueAtTime(0.0001, s);
+    gain.gain.exponentialRampToValueAtTime((n.velocity/127) * 0.25, s + 0.02);
+    gain.gain.setValueAtTime((n.velocity/127) * 0.25, e - 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, e + 0.02);
+    osc.start(s); osc.stop(e + 0.05);
+    osc2.start(s); osc2.stop(e + 0.05);
+    scheduled.push({source: osc, source2: osc2, gain});
+  });
+  // visual loop
+  const startTime = startAt;
+  function frame(){
+    if(!isPlaying) return;
+    const now = audioCtx.currentTime - startTime;
+    drawTimeline(now);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function stopWeb(){
+  isPlaying = false;
+  scheduled.forEach(o=>{
+    try{ o.source.stop(); o.source2.stop(); }catch(e){}
+  });
+  scheduled = [];
+  drawTimeline(0);
+}
+
+playBtn.onclick = ()=>playWeb();
+stopBtn.onclick = ()=>stopWeb();
+
+</script>
+</body>
+</html>
